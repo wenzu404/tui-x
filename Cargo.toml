@@ -29,6 +29,19 @@ regex = "1"
 ratatui-image = { version = "9.0.0", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "0.25"
 
+# Crypto (E2EE DM decryption via Juicebox protocol)
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+argon2 = "0.5"
+curve25519-dalek = { version = "4", features = ["group"] }
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
+ciborium = "0.2"
+snow = "0.9"              # Noise protocol
+
 # Utility
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
