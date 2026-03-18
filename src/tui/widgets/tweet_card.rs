@@ -123,7 +123,7 @@ impl Widget for TweetCard<'_> {
             Theme::dimmed()
         };
 
-        let stats = Line::from(vec![
+        let mut stats_spans = vec![
             Span::styled(format!("💬 {} ", compact_num(self.tweet.reply_count)), Theme::dimmed()),
             Span::styled(format!("↻ {} ", compact_num(self.tweet.retweet_count)), rt_style),
             Span::styled(format!("♥ {} ", compact_num(self.tweet.like_count)), like_style),
@@ -137,7 +137,24 @@ impl Widget for TweetCard<'_> {
                 ),
                 Theme::dimmed(),
             ),
-        ]);
+        ];
+
+        // Media indicator
+        if !self.tweet.media.is_empty() {
+            use crate::api::models::MediaType;
+            let has_video = self.tweet.media.iter().any(|m| matches!(m.media_type, MediaType::Video));
+            let has_gif = self.tweet.media.iter().any(|m| matches!(m.media_type, MediaType::AnimatedGif));
+            let label = if has_video {
+                format!(" [video {}]", self.tweet.media.len())
+            } else if has_gif {
+                format!(" [gif {}]", self.tweet.media.len())
+            } else {
+                format!(" [img {}]", self.tweet.media.len())
+            };
+            stats_spans.push(Span::styled(label, Theme::accent()));
+        }
+
+        let stats = Line::from(stats_spans);
         buf.set_line(x, y, &stats, area.width.saturating_sub(4));
         y += 1;
 

@@ -575,27 +575,34 @@ impl XClient {
 
     // ── DM endpoints ───────────────────────────────────────────────
 
-    /// Fetch DM inbox via REST v1.1.
-    pub async fn dm_inbox(&self) -> Result<Value> {
-        self.rest_get(
-            "dm/inbox_initial_state.json",
-            &[
-                ("nsfw_filtering_enabled", "false"),
-                ("filter_low_quality", "false"),
-                ("include_quality", "all"),
-                ("dm_secret_conversations_enabled", "false"),
-                ("krs_registration_enabled", "true"),
-                ("cards_platform", "Web-12"),
-                ("include_cards", "1"),
-                ("include_ext_alt_text", "true"),
-                ("include_quote_count", "true"),
-                ("include_reply_count", "1"),
-                ("tweet_mode", "extended"),
-                ("include_ext_collab_control", "true"),
-                ("ext", "mediaColor,altText,mediaStats,highlightedLabel,hasNftAvatar,voiceInfo,birdwatchPivot,superFollowMetadata,unmentionInfo,editControl"),
-            ],
-        )
-        .await
+    /// Fetch DM inbox via REST v1.1 with optional cursor for pagination.
+    pub async fn dm_inbox(&self, cursor: Option<&str>) -> Result<Value> {
+        let mut params = vec![
+            ("nsfw_filtering_enabled", "false"),
+            ("filter_low_quality", "false"),
+            ("include_quality", "all"),
+            ("dm_secret_conversations_enabled", "false"),
+            ("krs_registration_enabled", "true"),
+            ("cards_platform", "Web-12"),
+            ("include_cards", "1"),
+            ("include_ext_alt_text", "true"),
+            ("include_quote_count", "true"),
+            ("include_reply_count", "1"),
+            ("tweet_mode", "extended"),
+            ("include_ext_collab_control", "true"),
+            ("ext", "mediaColor,altText,mediaStats,highlightedLabel,hasNftAvatar,voiceInfo,birdwatchPivot,superFollowMetadata,unmentionInfo,editControl"),
+        ];
+
+        // For pagination, use the same endpoint with cursor and max_id
+        let path = if let Some(c) = cursor {
+            params.push(("cursor", c));
+            params.push(("max_id", c));
+            "dm/inbox_initial_state.json"
+        } else {
+            "dm/inbox_initial_state.json"
+        };
+
+        self.rest_get(path, &params).await
     }
 
     /// Send a DM to a conversation.
