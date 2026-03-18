@@ -6,6 +6,7 @@ mod tui;
 
 use anyhow::Result;
 use app::App;
+use ratatui_image::picker::{Picker, ProtocolType};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,6 +26,15 @@ async fn main() -> Result<()> {
         })
         .init();
 
-    let mut app = App::new().await?;
+    // Create image picker BEFORE entering alternate screen
+    // (it queries terminal capabilities via stdio)
+    let picker = Picker::from_query_stdio()
+        .unwrap_or_else(|_| {
+            let mut p = Picker::halfblocks();
+            p.set_protocol_type(ProtocolType::Kitty);
+            p
+        });
+
+    let mut app = App::new(picker).await?;
     app.run().await
 }

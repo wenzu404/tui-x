@@ -3,6 +3,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -12,9 +13,12 @@ use crate::api::XClient;
 use crate::auth::AuthStore;
 use crate::config::Config;
 use crate::tui;
+use crate::tui::image_cache::ImageCache;
 use crate::tui::theme::Theme;
 use crate::tui::views::*;
 use crate::tui::widgets::*;
+use ratatui_image::picker::Picker;
+use ratatui_image::{Resize, StatefulImage};
 
 // ── Async messages ──────────────────────────────────────────────────
 
@@ -133,10 +137,12 @@ pub struct App {
     api_tx: mpsc::UnboundedSender<ApiResult>,
     /// Cached DM messages by conversation_id.
     dm_messages: std::collections::HashMap<String, Vec<DmMessage>>,
+    /// Image cache for inline images (RefCell for interior mutability during render).
+    images: RefCell<ImageCache>,
 }
 
 impl App {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(picker: Picker) -> Result<Self> {
         let config = Config::load().unwrap_or_default();
         let store = AuthStore::load().unwrap_or_default();
 
@@ -168,6 +174,14 @@ impl App {
             Screen::Auth
         };
 
+        let http_for_images = Arc::new(
+            reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 (X11; Linux x86_64)")
+                .build()
+                .unwrap_or_default(),
+        );
+        let images = ImageCache::new(picker, http_for_images);
+
         let mut app = App {
             client,
             account_name,
@@ -178,6 +192,7 @@ impl App {
             api_rx,
             api_tx,
             dm_messages: std::collections::HashMap::new(),
+            images: RefCell::new(images),
         };
 
         // Start initial load
@@ -206,11 +221,61 @@ impl App {
         }
     }
 
+    /// Pre-fetch images for currently visible tweets.
+    fn prefetch_visible_images(&mut self) {
+        let tweets: Vec<String> = match self.current_screen() {
+            Screen::Timeline {
+                tweets,
+                scroll_offset,
+                ..
+            } => tweets
+                .iter()
+                .skip(*scroll_offset)
+                .take(15)
+                .flat_map(|t| {
+                    t.media.iter().filter_map(|m| {
+                        m.thumbnail_url.as_ref().map(|u| ImageCache::thumb_url(u))
+                    })
+                })
+                .collect(),
+            Screen::TweetDetail {
+                main_tweet,
+                replies,
+                ..
+            } => {
+                let mut urls = Vec::new();
+                if let Some(tweet) = main_tweet {
+                    for m in &tweet.media {
+                        if let Some(ref u) = m.thumbnail_url {
+                            urls.push(ImageCache::thumb_url(u));
+                        }
+                    }
+                }
+                for r in replies.iter().take(5) {
+                    for m in &r.media {
+                        if let Some(ref u) = m.thumbnail_url {
+                            urls.push(ImageCache::thumb_url(u));
+                        }
+                    }
+                }
+                urls
+            }
+            _ => Vec::new(),
+        };
+
+        let mut img_cache = self.images.borrow_mut();
+        for url in tweets {
+            img_cache.request(&url);
+        }
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         let mut terminal = tui::init().context("Failed to initialize terminal")?;
 
         while !self.should_quit {
             self.drain_api_results();
+            self.images.borrow_mut().drain();
+            self.prefetch_visible_images();
             terminal.draw(|f| self.render(f))?;
 
             if let Some(key) = tui::next_key_event(Duration::from_millis(16))? {
@@ -605,8 +670,46 @@ impl App {
                     let empty = Paragraph::new("  No tweets").style(Theme::dimmed());
                     frame.render_widget(empty, content_layout[1]);
                 } else {
-                    let view = TimelineView::new(tweets, *selected, *scroll_offset);
-                    frame.render_widget(view, content_layout[1]);
+                    // Check if selected tweet has images we can show
+                    let selected_media_url = tweets
+                        .get(*selected)
+                        .and_then(|t| t.media.first())
+                        .and_then(|m| m.thumbnail_url.as_ref())
+                        .map(|u| ImageCache::thumb_url(u));
+
+                    let has_image = selected_media_url
+                        .as_ref()
+                        .is_some_and(|url| self.images.borrow().is_ready(url));
+
+                    if has_image && content_layout[1].width > 60 {
+                        // Split: tweets on left, image on right
+                        let split = Layout::horizontal([
+                            Constraint::Min(40),
+                            Constraint::Length(content_layout[1].width / 3),
+                        ])
+                        .split(content_layout[1]);
+
+                        let view = TimelineView::new(tweets, *selected, *scroll_offset);
+                        frame.render_widget(view, split[0]);
+
+                        // Render image
+                        let img_area = Rect {
+                            x: split[1].x + 1,
+                            y: split[1].y,
+                            width: split[1].width.saturating_sub(2),
+                            height: split[1].height.min(20),
+                        };
+                        if let Some(url) = &selected_media_url {
+                            if let Some(protocol) = self.images.borrow_mut().get(url) {
+                                let img_widget = StatefulImage::new()
+                                    .resize(Resize::Fit(None));
+                                frame.render_stateful_widget(img_widget, img_area, protocol);
+                            }
+                        }
+                    } else {
+                        let view = TimelineView::new(tweets, *selected, *scroll_offset);
+                        frame.render_widget(view, content_layout[1]);
+                    }
                 }
             }
             Screen::TweetDetail {
@@ -618,14 +721,54 @@ impl App {
                 ..
             } => {
                 if let Some(tweet) = main_tweet {
-                    let view = TweetDetailView {
-                        main_tweet: tweet,
-                        parents,
-                        replies,
-                        selected_reply: *selected_reply,
-                        scroll_offset: *scroll_offset,
-                    };
-                    frame.render_widget(view, layout[0]);
+                    let media_url = tweet
+                        .media
+                        .first()
+                        .and_then(|m| m.thumbnail_url.as_ref())
+                        .map(|u| ImageCache::thumb_url(u));
+                    let has_img = media_url
+                        .as_ref()
+                        .is_some_and(|url| self.images.borrow().is_ready(url));
+
+                    if has_img && layout[0].width > 60 {
+                        let split = Layout::horizontal([
+                            Constraint::Min(40),
+                            Constraint::Length(layout[0].width / 3),
+                        ])
+                        .split(layout[0]);
+
+                        let view = TweetDetailView {
+                            main_tweet: tweet,
+                            parents,
+                            replies,
+                            selected_reply: *selected_reply,
+                            scroll_offset: *scroll_offset,
+                        };
+                        frame.render_widget(view, split[0]);
+
+                        if let Some(url) = &media_url {
+                            let img_area = Rect {
+                                x: split[1].x + 1,
+                                y: split[1].y,
+                                width: split[1].width.saturating_sub(2),
+                                height: split[1].height.min(25),
+                            };
+                            if let Some(protocol) = self.images.borrow_mut().get(url) {
+                                let img_widget = StatefulImage::new()
+                                    .resize(Resize::Fit(None));
+                                frame.render_stateful_widget(img_widget, img_area, protocol);
+                            }
+                        }
+                    } else {
+                        let view = TweetDetailView {
+                            main_tweet: tweet,
+                            parents,
+                            replies,
+                            selected_reply: *selected_reply,
+                            scroll_offset: *scroll_offset,
+                        };
+                        frame.render_widget(view, layout[0]);
+                    }
                 } else {
                     let loading = Paragraph::new("  Loading thread...").style(Theme::dimmed());
                     frame.render_widget(loading, layout[0]);

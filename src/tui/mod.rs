@@ -1,3 +1,4 @@
+pub mod image_cache;
 pub mod theme;
 pub mod views;
 pub mod widgets;

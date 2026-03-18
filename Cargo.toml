@@ -25,6 +25,10 @@ toml = "0.8"
 scraper = "0.22"
 regex = "1"
 
+# Images
+ratatui-image = { version = "9.0.0", default-features = false, features = ["crossterm", "image-defaults"] }
+image = "0.25"
+
 # Utility
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
