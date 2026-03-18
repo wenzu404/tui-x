@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -7,16 +7,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::api::models::{TimelineResponse, Tweet};
+use crate::api::models::*;
 use crate::api::XClient;
 use crate::auth::AuthStore;
 use crate::config::Config;
 use crate::tui;
 use crate::tui::theme::Theme;
-use crate::tui::views::TimelineView;
-use crate::tui::widgets::StatusBar;
+use crate::tui::views::*;
+use crate::tui::widgets::*;
 
-// ── Messages between background tasks and the UI ────────────────────
+// ── Async messages ──────────────────────────────────────────────────
 
 enum ApiResult {
     Timeline {
@@ -24,10 +24,23 @@ enum ApiResult {
         append: bool,
         tab: FeedTab,
     },
-    ActionOk {
-        action: TweetAction,
-        tweet_id: String,
+    TweetDetail(Box<ThreadResponse>),
+    UserProfile {
+        user: User,
     },
+    UserTweets {
+        response: TimelineResponse,
+        user_id: String,
+        append: bool,
+    },
+    DmInbox(Vec<DmConversation>),
+    DmMessages {
+        conversation_id: String,
+        messages: Vec<DmMessage>,
+    },
+    TweetSent,
+    DmSent,
+    ActionOk,
     ActionErr {
         action: TweetAction,
         tweet_id: String,
@@ -46,7 +59,7 @@ enum TweetAction {
     Unbookmark,
 }
 
-// ── App state ───────────────────────────────────────────────────────
+// ── View stack ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedTab {
@@ -63,25 +76,59 @@ impl FeedTab {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum View {
-    Timeline,
-    Loading,
+/// Each screen the user can navigate to.
+enum Screen {
+    Timeline {
+        tab: FeedTab,
+        tweets: Vec<Tweet>,
+        selected: usize,
+        scroll_offset: usize,
+        cursor_bottom: Option<String>,
+    },
+    TweetDetail {
+        tweet_id: String,
+        main_tweet: Option<Tweet>,
+        parents: Vec<Tweet>,
+        replies: Vec<Tweet>,
+        selected_reply: usize,
+        scroll_offset: usize,
+    },
+    Profile {
+        screen_name: String,
+        user: Option<User>,
+        tweets: Vec<Tweet>,
+        selected: usize,
+        scroll_offset: usize,
+        cursor_bottom: Option<String>,
+    },
+    Compose {
+        mode: ComposeMode,
+        input: TextInput,
+    },
+    DmInbox {
+        conversations: Vec<DmConversation>,
+        selected: usize,
+    },
+    DmConversation {
+        conversation_id: String,
+        participant_name: String,
+        messages: Vec<DmMessage>,
+        input: TextInput,
+        scroll_offset: usize,
+    },
+    Loading {
+        message: String,
+    },
     Auth,
 }
 
 pub struct App {
     client: Option<Arc<XClient>>,
     account_name: String,
-    tweets: Vec<Tweet>,
-    selected: usize,
-    scroll_offset: usize,
-    tab: FeedTab,
-    cursor_bottom: Option<String>,
-    view: View,
+    my_user_id: String,
+    screens: Vec<Screen>,
     should_quit: bool,
     status_msg: Option<String>,
-    // Channel for receiving API results
     api_rx: mpsc::UnboundedReceiver<ApiResult>,
     api_tx: mpsc::UnboundedSender<ApiResult>,
 }
@@ -110,56 +157,66 @@ impl App {
         };
 
         let (api_tx, api_rx) = mpsc::unbounded_channel();
-        let view = if client.is_none() {
-            View::Auth
+
+        let initial_screen = if client.is_some() {
+            Screen::Loading {
+                message: "Loading timeline...".to_string(),
+            }
         } else {
-            View::Loading
+            Screen::Auth
         };
 
-        Ok(Self {
+        let mut app = App {
             client,
             account_name,
-            tweets: Vec::new(),
-            selected: 0,
-            scroll_offset: 0,
-            tab: FeedTab::Following,
-            cursor_bottom: None,
-            view,
+            my_user_id: String::new(),
+            screens: vec![initial_screen],
             should_quit: false,
             status_msg: None,
             api_rx,
             api_tx,
-        })
+        };
+
+        // Start initial load
+        if app.client.is_some() {
+            app.spawn_fetch_timeline(FeedTab::Following, false, None);
+        }
+
+        Ok(app)
+    }
+
+    fn current_screen(&self) -> &Screen {
+        self.screens.last().unwrap()
+    }
+
+    fn current_screen_mut(&mut self) -> &mut Screen {
+        self.screens.last_mut().unwrap()
+    }
+
+    fn push_screen(&mut self, screen: Screen) {
+        self.screens.push(screen);
+    }
+
+    fn pop_screen(&mut self) {
+        if self.screens.len() > 1 {
+            self.screens.pop();
+        }
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let mut terminal = tui::init().context("Failed to initialize terminal")?;
 
-        // Kick off initial timeline load (non-blocking)
-        if self.client.is_some() {
-            self.spawn_fetch_timeline(false);
-        }
-
-        // Main event loop — never blocks on network
         while !self.should_quit {
-            // 1. Process any pending API results
             self.drain_api_results();
-
-            // 2. Render
             terminal.draw(|f| self.render(f))?;
 
-            // 3. Poll input (short timeout so we stay responsive)
             if let Some(key) = tui::next_key_event(Duration::from_millis(16))? {
-                if tui::is_quit(&key) {
+                // Global quit
+                if tui::is_quit(&key) && !self.is_input_mode() {
                     self.should_quit = true;
                     continue;
                 }
-
-                match self.view {
-                    View::Timeline => self.handle_timeline_key(key),
-                    View::Auth => self.handle_auth_key(key),
-                    View::Loading => {}
-                }
+                self.handle_key(key);
             }
         }
 
@@ -167,20 +224,23 @@ impl App {
         Ok(())
     }
 
-    // ── Background API calls ────────────────────────────────────────
+    fn is_input_mode(&self) -> bool {
+        matches!(
+            self.current_screen(),
+            Screen::Compose { .. } | Screen::DmConversation { .. }
+        )
+    }
 
-    fn spawn_fetch_timeline(&self, append: bool) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
+    // ── Background spawners ─────────────────────────────────────────
+
+    fn spawn_fetch_timeline(
+        &self,
+        tab: FeedTab,
+        append: bool,
+        cursor: Option<String>,
+    ) {
+        let Some(client) = self.client.clone() else { return };
         let tx = self.api_tx.clone();
-        let tab = self.tab;
-        let cursor = if append {
-            self.cursor_bottom.clone()
-        } else {
-            None
-        };
-
         tokio::spawn(async move {
             let result = match tab {
                 FeedTab::ForYou => client.home_timeline(20, cursor.as_deref()).await,
@@ -195,34 +255,133 @@ impl App {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(ApiResult::Error(format!("Timeline: {e}")));
+                    let _ = tx.send(ApiResult::Error(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn spawn_tweet_detail(&self, tweet_id: String) {
+        let Some(client) = self.client.clone() else { return };
+        let tx = self.api_tx.clone();
+        tokio::spawn(async move {
+            match client.tweet_detail(&tweet_id).await {
+                Ok(thread) => {
+                    let _ = tx.send(ApiResult::TweetDetail(Box::new(thread)));
+                }
+                Err(e) => {
+                    let _ = tx.send(ApiResult::Error(format!("Thread: {e}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_user_profile(&self, screen_name: String) {
+        let Some(client) = self.client.clone() else { return };
+        let tx = self.api_tx.clone();
+        let sn = screen_name.clone();
+        tokio::spawn(async move {
+            match client.user_by_screen_name(&sn).await {
+                Ok(user) => {
+                    let user_id = user.id.clone();
+                    let _ = tx.send(ApiResult::UserProfile { user });
+                    // Also fetch their tweets
+                    match client.user_tweets(&user_id, 20, None).await {
+                        Ok(response) => {
+                            let _ = tx.send(ApiResult::UserTweets {
+                                response,
+                                user_id,
+                                append: false,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ApiResult::Error(format!("User tweets: {e}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(ApiResult::Error(format!("Profile: {e}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_dm_inbox(&self) {
+        let Some(client) = self.client.clone() else { return };
+        let tx = self.api_tx.clone();
+        tokio::spawn(async move {
+            match client.dm_inbox().await {
+                Ok(data) => {
+                    let convos = parse_dm_inbox(&data);
+                    let _ = tx.send(ApiResult::DmInbox(convos));
+                }
+                Err(e) => {
+                    let _ = tx.send(ApiResult::Error(format!("DMs: {e}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_send_tweet(&self, text: String, mode: ComposeMode) {
+        let Some(client) = self.client.clone() else { return };
+        let tx = self.api_tx.clone();
+        tokio::spawn(async move {
+            let result = match &mode {
+                ComposeMode::NewTweet => {
+                    client.create_tweet(&text, None, None, vec![]).await
+                }
+                ComposeMode::Reply { tweet_id, .. } => {
+                    client
+                        .create_tweet(&text, Some(tweet_id), None, vec![])
+                        .await
+                }
+                ComposeMode::Quote { tweet_url } => {
+                    client
+                        .create_tweet(&text, None, Some(tweet_url), vec![])
+                        .await
+                }
+            };
+            match result {
+                Ok(_) => {
+                    let _ = tx.send(ApiResult::TweetSent);
+                }
+                Err(e) => {
+                    let _ = tx.send(ApiResult::Error(format!("Tweet: {e}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_send_dm(&self, conversation_id: String, text: String) {
+        let Some(client) = self.client.clone() else { return };
+        let tx = self.api_tx.clone();
+        tokio::spawn(async move {
+            match client.send_dm(&conversation_id, &text).await {
+                Ok(_) => {
+                    let _ = tx.send(ApiResult::DmSent);
+                }
+                Err(e) => {
+                    let _ = tx.send(ApiResult::Error(format!("DM: {e}")));
                 }
             }
         });
     }
 
     fn spawn_tweet_action(&self, tweet_id: String, action: TweetAction) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
+        let Some(client) = self.client.clone() else { return };
         let tx = self.api_tx.clone();
-        let id = tweet_id.clone();
-
         tokio::spawn(async move {
             let result = match action {
-                TweetAction::Like => client.like(&id).await,
-                TweetAction::Unlike => client.unlike(&id).await,
-                TweetAction::Retweet => client.retweet(&id).await,
-                TweetAction::Unretweet => client.unretweet(&id).await,
-                TweetAction::Bookmark => client.bookmark(&id).await,
-                TweetAction::Unbookmark => client.unbookmark(&id).await,
+                TweetAction::Like => client.like(&tweet_id).await,
+                TweetAction::Unlike => client.unlike(&tweet_id).await,
+                TweetAction::Retweet => client.retweet(&tweet_id).await,
+                TweetAction::Unretweet => client.unretweet(&tweet_id).await,
+                TweetAction::Bookmark => client.bookmark(&tweet_id).await,
+                TweetAction::Unbookmark => client.unbookmark(&tweet_id).await,
             };
             match result {
                 Ok(_) => {
-                    let _ = tx.send(ApiResult::ActionOk {
-                        action,
-                        tweet_id,
-                    });
+                    let _ = tx.send(ApiResult::ActionOk);
                 }
                 Err(e) => {
                     let _ = tx.send(ApiResult::ActionErr {
@@ -235,7 +394,8 @@ impl App {
         });
     }
 
-    /// Process all pending API results without blocking.
+    // ── Process API results ─────────────────────────────────────────
+
     fn drain_api_results(&mut self) {
         while let Ok(msg) = self.api_rx.try_recv() {
             match msg {
@@ -244,63 +404,166 @@ impl App {
                     append,
                     tab,
                 } => {
-                    // Only apply if we're still on the same tab
-                    if tab == self.tab {
-                        if append {
-                            self.tweets.extend(response.tweets);
-                        } else {
-                            self.tweets = response.tweets;
-                            self.selected = 0;
-                            self.scroll_offset = 0;
+                    // Find or create the right timeline screen
+                    let screen = self.current_screen_mut();
+                    match screen {
+                        Screen::Loading { .. } => {
+                            *screen = Screen::Timeline {
+                                tab,
+                                tweets: response.tweets,
+                                selected: 0,
+                                scroll_offset: 0,
+                                cursor_bottom: response.cursor_bottom,
+                            };
                         }
-                        self.cursor_bottom = response.cursor_bottom;
-                        self.view = View::Timeline;
-                        self.status_msg = None;
+                        Screen::Timeline {
+                            tab: existing_tab,
+                            tweets,
+                            cursor_bottom,
+                            selected,
+                            scroll_offset,
+                            ..
+                        } if *existing_tab == tab => {
+                            if append {
+                                tweets.extend(response.tweets);
+                            } else {
+                                *tweets = response.tweets;
+                                *selected = 0;
+                                *scroll_offset = 0;
+                            }
+                            *cursor_bottom = response.cursor_bottom;
+                        }
+                        _ => {}
                     }
                 }
-                ApiResult::ActionOk { .. } => {
-                    // Already applied optimistically — nothing to do
+                ApiResult::TweetDetail(thread) => {
+                    let screen = self.current_screen_mut();
+                    if let Screen::TweetDetail {
+                        main_tweet,
+                        parents,
+                        replies,
+                        ..
+                    } = screen
+                    {
+                        *main_tweet = Some(thread.main_tweet);
+                        *parents = thread.parents;
+                        *replies = thread.replies;
+                    }
                 }
+                ApiResult::UserProfile { user } => {
+                    let uid = user.id.clone();
+                    let screen = self.current_screen_mut();
+                    if let Screen::Profile {
+                        user: existing_user,
+                        ..
+                    } = screen
+                    {
+                        *existing_user = Some(user);
+                    }
+                    self.my_user_id = uid;
+                }
+                ApiResult::UserTweets {
+                    response, append, ..
+                } => {
+                    let screen = self.current_screen_mut();
+                    if let Screen::Profile {
+                        tweets,
+                        cursor_bottom,
+                        ..
+                    } = screen
+                    {
+                        if append {
+                            tweets.extend(response.tweets);
+                        } else {
+                            *tweets = response.tweets;
+                        }
+                        *cursor_bottom = response.cursor_bottom;
+                    }
+                }
+                ApiResult::DmInbox(convos) => {
+                    let screen = self.current_screen_mut();
+                    match screen {
+                        Screen::Loading { .. } | Screen::DmInbox { .. } => {
+                            *screen = Screen::DmInbox {
+                                conversations: convos,
+                                selected: 0,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                ApiResult::DmMessages {
+                    messages,
+                    conversation_id: _,
+                } => {
+                    let screen = self.current_screen_mut();
+                    if let Screen::DmConversation {
+                        messages: existing, ..
+                    } = screen
+                    {
+                        *existing = messages;
+                    }
+                }
+                ApiResult::TweetSent => {
+                    self.status_msg = Some("Tweet sent!".to_string());
+                    self.pop_screen();
+                }
+                ApiResult::DmSent => {
+                    self.status_msg = Some("DM sent!".to_string());
+                    // Refresh DM inbox
+                    self.spawn_dm_inbox();
+                }
+                ApiResult::ActionOk => {}
                 ApiResult::ActionErr {
                     action,
-                    error,
                     tweet_id,
+                    error,
                 } => {
                     // Rollback optimistic update
-                    if let Some(tweet) = self.tweets.iter_mut().find(|t| t.id == tweet_id) {
-                        match action {
-                            TweetAction::Like => {
-                                tweet.favorited = false;
-                                tweet.like_count = tweet.like_count.saturating_sub(1);
-                            }
-                            TweetAction::Unlike => {
-                                tweet.favorited = true;
-                                tweet.like_count += 1;
-                            }
-                            TweetAction::Retweet => {
-                                tweet.retweeted = false;
-                                tweet.retweet_count = tweet.retweet_count.saturating_sub(1);
-                            }
-                            TweetAction::Unretweet => {
-                                tweet.retweeted = true;
-                                tweet.retweet_count += 1;
-                            }
-                            TweetAction::Bookmark => {
-                                tweet.bookmarked = false;
-                            }
-                            TweetAction::Unbookmark => {
-                                tweet.bookmarked = true;
-                            }
-                        }
-                    }
+                    self.rollback_action(&tweet_id, action);
                     self.status_msg = Some(format!("{action:?} failed: {error}"));
                 }
                 ApiResult::Error(e) => {
                     self.status_msg = Some(e);
-                    if self.view == View::Loading {
-                        self.view = View::Timeline;
+                    // If we're on a loading screen, go back
+                    if matches!(self.current_screen(), Screen::Loading { .. }) {
+                        if self.screens.len() > 1 {
+                            self.pop_screen();
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    fn rollback_action(&mut self, tweet_id: &str, action: TweetAction) {
+        // Find the tweet in current screen's tweets
+        let tweets = match self.current_screen_mut() {
+            Screen::Timeline { tweets, .. } => tweets,
+            Screen::TweetDetail { replies, .. } => replies,
+            Screen::Profile { tweets, .. } => tweets,
+            _ => return,
+        };
+        if let Some(tweet) = tweets.iter_mut().find(|t| t.id == tweet_id) {
+            match action {
+                TweetAction::Like => {
+                    tweet.favorited = false;
+                    tweet.like_count = tweet.like_count.saturating_sub(1);
+                }
+                TweetAction::Unlike => {
+                    tweet.favorited = true;
+                    tweet.like_count += 1;
+                }
+                TweetAction::Retweet => {
+                    tweet.retweeted = false;
+                    tweet.retweet_count = tweet.retweet_count.saturating_sub(1);
+                }
+                TweetAction::Unretweet => {
+                    tweet.retweeted = true;
+                    tweet.retweet_count += 1;
+                }
+                TweetAction::Bookmark => tweet.bookmarked = false,
+                TweetAction::Unbookmark => tweet.bookmarked = true,
             }
         }
     }
@@ -310,25 +573,112 @@ impl App {
     fn render(&self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         let layout = Layout::vertical([
-            Constraint::Length(2), // tabs
             Constraint::Min(1),   // content
             Constraint::Length(1), // status bar
         ])
         .split(size);
 
-        match self.view {
-            View::Timeline => {
-                self.render_tabs(frame, layout[0]);
-                self.render_timeline(frame, layout[1]);
+        match self.current_screen() {
+            Screen::Timeline {
+                tab,
+                tweets,
+                selected,
+                scroll_offset,
+                ..
+            } => {
+                let content_layout = Layout::vertical([
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                ])
+                .split(layout[0]);
+
+                self.render_tabs(frame, content_layout[0], *tab);
+
+                if tweets.is_empty() {
+                    let empty = Paragraph::new("  No tweets").style(Theme::dimmed());
+                    frame.render_widget(empty, content_layout[1]);
+                } else {
+                    let view = TimelineView::new(tweets, *selected, *scroll_offset);
+                    frame.render_widget(view, content_layout[1]);
+                }
             }
-            View::Loading => {
-                self.render_tabs(frame, layout[0]);
-                let loading = Paragraph::new("  Loading...")
-                    .style(Theme::dimmed())
-                    .block(Block::default().borders(Borders::NONE));
-                frame.render_widget(loading, layout[1]);
+            Screen::TweetDetail {
+                main_tweet,
+                parents,
+                replies,
+                selected_reply,
+                scroll_offset,
+                ..
+            } => {
+                if let Some(tweet) = main_tweet {
+                    let view = TweetDetailView {
+                        main_tweet: tweet,
+                        parents,
+                        replies,
+                        selected_reply: *selected_reply,
+                        scroll_offset: *scroll_offset,
+                    };
+                    frame.render_widget(view, layout[0]);
+                } else {
+                    let loading = Paragraph::new("  Loading thread...").style(Theme::dimmed());
+                    frame.render_widget(loading, layout[0]);
+                }
             }
-            View::Auth => {
+            Screen::Profile {
+                user,
+                tweets,
+                selected,
+                scroll_offset,
+                ..
+            } => {
+                if let Some(u) = user {
+                    let view = ProfileView {
+                        user: u,
+                        tweets,
+                        selected: *selected,
+                        scroll_offset: *scroll_offset,
+                    };
+                    frame.render_widget(view, layout[0]);
+                } else {
+                    let loading = Paragraph::new("  Loading profile...").style(Theme::dimmed());
+                    frame.render_widget(loading, layout[0]);
+                }
+            }
+            Screen::Compose { mode, input } => {
+                let view = ComposeView { input, mode };
+                frame.render_widget(view, layout[0]);
+            }
+            Screen::DmInbox {
+                conversations,
+                selected,
+            } => {
+                let view = DmInboxView {
+                    conversations,
+                    selected: *selected,
+                };
+                frame.render_widget(view, layout[0]);
+            }
+            Screen::DmConversation {
+                participant_name,
+                messages,
+                input,
+                scroll_offset,
+                ..
+            } => {
+                let view = DmConversationView {
+                    participant_name,
+                    messages,
+                    my_user_id: &self.my_user_id,
+                    input,
+                    scroll_offset: *scroll_offset,
+                };
+                frame.render_widget(view, layout[0]);
+            }
+            Screen::Loading { message } => {
+                let loading = Paragraph::new(format!("  {message}")).style(Theme::dimmed());
+                frame.render_widget(loading, layout[0]);
+            }
+            Screen::Auth => {
                 let msg = Paragraph::new(vec![
                     Line::from(Span::styled("Not authenticated", Theme::bold())),
                     Line::from(""),
@@ -348,52 +698,31 @@ impl App {
                         .borders(Borders::ALL)
                         .border_style(Theme::border()),
                 );
-                frame.render_widget(msg, layout[1]);
+                frame.render_widget(msg, layout[0]);
             }
         }
 
         // Status bar
-        let hints: &[(&str, &str)] = match self.view {
-            View::Timeline => &[
-                ("j/k", "nav"),
-                ("Tab", "feed"),
-                ("f", "like"),
-                ("t", "RT"),
-                ("b", "mark"),
-                ("Space", "more"),
-                ("q", "quit"),
-            ],
-            _ => &[("q", "quit")],
-        };
-
-        let view_label = match self.view {
-            View::Timeline => self.tab.label(),
-            View::Loading => "Loading",
-            View::Auth => "Auth",
-        };
-
-        // Show status message if any
+        let (hints, view_label) = self.current_hints();
         let account_display = if let Some(ref msg) = self.status_msg {
             format!("{} | {msg}", self.account_name)
         } else {
             self.account_name.clone()
         };
-
         let status = StatusBar {
             account: &account_display,
             view: view_label,
-            hints,
+            hints: &hints,
         };
-        frame.render_widget(status, layout[2]);
+        frame.render_widget(status, layout[1]);
     }
 
-    fn render_tabs(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn render_tabs(&self, frame: &mut ratatui::Frame, area: Rect, active_tab: FeedTab) {
         let tabs = [FeedTab::ForYou, FeedTab::Following];
-
         let spans: Vec<Span> = tabs
             .iter()
             .flat_map(|tab| {
-                let style = if *tab == self.tab {
+                let style = if *tab == active_tab {
                     Theme::tab_active()
                 } else {
                     Theme::tab_inactive()
@@ -404,144 +733,751 @@ impl App {
                 ]
             })
             .collect();
-
-        let line = Line::from(spans);
-        let tabs_widget = Paragraph::new(line)
+        let tabs_widget = Paragraph::new(Line::from(spans))
             .block(Block::default().borders(Borders::BOTTOM).border_style(Theme::border()));
         frame.render_widget(tabs_widget, area);
     }
 
-    fn render_timeline(&self, frame: &mut ratatui::Frame, area: Rect) {
-        if self.tweets.is_empty() {
-            let empty = Paragraph::new("  No tweets").style(Theme::dimmed());
-            frame.render_widget(empty, area);
-            return;
+    fn current_hints(&self) -> (Vec<(&str, &str)>, &str) {
+        match self.current_screen() {
+            Screen::Timeline { tab, .. } => (
+                vec![
+                    ("j/k", "nav"),
+                    ("Enter", "open"),
+                    ("Tab", "feed"),
+                    ("f", "like"),
+                    ("t", "RT"),
+                    ("b", "mark"),
+                    ("n", "tweet"),
+                    ("p", "profile"),
+                    ("d", "DMs"),
+                    ("Space", "more"),
+                ],
+                tab.label(),
+            ),
+            Screen::TweetDetail { .. } => (
+                vec![
+                    ("j/k", "nav"),
+                    ("r", "reply"),
+                    ("f", "like"),
+                    ("q", "quote"),
+                    ("Esc", "back"),
+                ],
+                "Thread",
+            ),
+            Screen::Profile { .. } => (
+                vec![
+                    ("j/k", "nav"),
+                    ("Enter", "open"),
+                    ("Space", "more"),
+                    ("Esc", "back"),
+                ],
+                "Profile",
+            ),
+            Screen::Compose { .. } => (
+                vec![("C-Enter", "send"), ("Esc", "cancel")],
+                "Compose",
+            ),
+            Screen::DmInbox { .. } => (
+                vec![
+                    ("j/k", "nav"),
+                    ("Enter", "open"),
+                    ("Esc", "back"),
+                ],
+                "Messages",
+            ),
+            Screen::DmConversation { .. } => (
+                vec![("Enter", "send"), ("Esc", "back")],
+                "DM",
+            ),
+            Screen::Loading { .. } => (vec![], "Loading"),
+            Screen::Auth => (vec![("q", "quit")], "Auth"),
         }
-
-        let view = TimelineView::new(&self.tweets, self.selected, self.scroll_offset);
-        frame.render_widget(view, area);
     }
 
-    // ── Input handling (all non-blocking now) ───────────────────────
+    // ── Input handling ──────────────────────────────────────────────
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
+        // Clear status message on any key
+        self.status_msg = None;
+
+        match self.current_screen() {
+            Screen::Timeline { .. } => self.handle_timeline_key(key),
+            Screen::TweetDetail { .. } => self.handle_detail_key(key),
+            Screen::Profile { .. } => self.handle_profile_key(key),
+            Screen::Compose { .. } => self.handle_compose_key(key),
+            Screen::DmInbox { .. } => self.handle_dm_inbox_key(key),
+            Screen::DmConversation { .. } => self.handle_dm_conversation_key(key),
+            Screen::Loading { .. } => {
+                if key.code == KeyCode::Esc {
+                    self.pop_screen();
+                }
+            }
+            Screen::Auth => {
+                if key.code == KeyCode::Char('q') {
+                    self.should_quit = true;
+                }
+            }
+        }
+    }
 
     fn handle_timeline_key(&mut self, key: crossterm::event::KeyEvent) {
-        match key.code {
-            // Navigation
-            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
-            KeyCode::Char('g') => self.select_first(),
-            KeyCode::Char('G') => self.select_last(),
+        // First extract data we need from the current screen
+        let (tab, tweet_count, selected, cursor_bottom) = {
+            let Screen::Timeline {
+                tab,
+                tweets,
+                selected,
+                cursor_bottom,
+                ..
+            } = self.current_screen()
+            else {
+                return;
+            };
+            (*tab, tweets.len(), *selected, cursor_bottom.clone())
+        };
 
-            // Tab switching — instant, fetch in background
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Screen::Timeline {
+                    tweets,
+                    selected,
+                    scroll_offset,
+                    ..
+                } = self.current_screen_mut()
+                {
+                    if !tweets.is_empty() {
+                        *selected = (*selected + 1).min(tweets.len() - 1);
+                        if *selected > *scroll_offset + 10 {
+                            *scroll_offset = selected.saturating_sub(5);
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Screen::Timeline {
+                    selected,
+                    scroll_offset,
+                    ..
+                } = self.current_screen_mut()
+                {
+                    *selected = selected.saturating_sub(1);
+                    if *selected < *scroll_offset {
+                        *scroll_offset = *selected;
+                    }
+                }
+            }
+            KeyCode::Char('g') => {
+                if let Screen::Timeline {
+                    selected,
+                    scroll_offset,
+                    ..
+                } = self.current_screen_mut()
+                {
+                    *selected = 0;
+                    *scroll_offset = 0;
+                }
+            }
+            KeyCode::Char('G') => {
+                if let Screen::Timeline {
+                    tweets,
+                    selected,
+                    scroll_offset,
+                    ..
+                } = self.current_screen_mut()
+                {
+                    if !tweets.is_empty() {
+                        *selected = tweets.len() - 1;
+                        *scroll_offset = selected.saturating_sub(5);
+                    }
+                }
+            }
             KeyCode::Tab | KeyCode::BackTab => {
-                self.tab = match self.tab {
+                let new_tab = match tab {
                     FeedTab::ForYou => FeedTab::Following,
                     FeedTab::Following => FeedTab::ForYou,
                 };
-                self.tweets.clear();
-                self.selected = 0;
-                self.scroll_offset = 0;
-                self.cursor_bottom = None;
-                self.view = View::Loading;
-                self.spawn_fetch_timeline(false);
+                if let Screen::Timeline {
+                    tab,
+                    tweets,
+                    selected,
+                    scroll_offset,
+                    cursor_bottom,
+                } = self.current_screen_mut()
+                {
+                    *tab = new_tab;
+                    tweets.clear();
+                    *selected = 0;
+                    *scroll_offset = 0;
+                    *cursor_bottom = None;
+                }
+                self.spawn_fetch_timeline(new_tab, false, None);
             }
-
-            // Like (optimistic update + background confirm)
-            KeyCode::Char('f') => {
-                if let Some(tweet) = self.tweets.get_mut(self.selected) {
-                    let id = tweet.id.clone();
-                    let action = if tweet.favorited {
-                        tweet.favorited = false;
-                        tweet.like_count = tweet.like_count.saturating_sub(1);
-                        TweetAction::Unlike
-                    } else {
-                        tweet.favorited = true;
-                        tweet.like_count += 1;
-                        TweetAction::Like
-                    };
-                    drop(tweet);
-                    self.spawn_tweet_action(id, action);
+            KeyCode::Enter | KeyCode::Char('l') => {
+                // Open tweet detail
+                if let Screen::Timeline { tweets, selected, .. } = self.current_screen() {
+                    if let Some(tweet) = tweets.get(*selected) {
+                        let tweet_id = tweet.id.clone();
+                        self.push_screen(Screen::TweetDetail {
+                            tweet_id: tweet_id.clone(),
+                            main_tweet: None,
+                            parents: Vec::new(),
+                            replies: Vec::new(),
+                            selected_reply: 0,
+                            scroll_offset: 0,
+                        });
+                        self.spawn_tweet_detail(tweet_id);
+                    }
                 }
             }
-
-            // Retweet
-            KeyCode::Char('t') => {
-                if let Some(tweet) = self.tweets.get_mut(self.selected) {
-                    let id = tweet.id.clone();
-                    let action = if tweet.retweeted {
-                        tweet.retweeted = false;
-                        tweet.retweet_count = tweet.retweet_count.saturating_sub(1);
-                        TweetAction::Unretweet
-                    } else {
-                        tweet.retweeted = true;
-                        tweet.retweet_count += 1;
-                        TweetAction::Retweet
-                    };
-                    drop(tweet);
-                    self.spawn_tweet_action(id, action);
+            KeyCode::Char('p') => {
+                // Open profile of selected tweet's author
+                if let Screen::Timeline { tweets, selected, .. } = self.current_screen() {
+                    if let Some(tweet) = tweets.get(*selected) {
+                        let sn = tweet.author.screen_name.clone();
+                        self.push_screen(Screen::Profile {
+                            screen_name: sn.clone(),
+                            user: None,
+                            tweets: Vec::new(),
+                            selected: 0,
+                            scroll_offset: 0,
+                            cursor_bottom: None,
+                        });
+                        self.spawn_user_profile(sn);
+                    }
                 }
             }
-
-            // Bookmark
-            KeyCode::Char('b') => {
-                if let Some(tweet) = self.tweets.get_mut(self.selected) {
-                    let id = tweet.id.clone();
-                    let action = if tweet.bookmarked {
-                        tweet.bookmarked = false;
-                        TweetAction::Unbookmark
-                    } else {
-                        tweet.bookmarked = true;
-                        TweetAction::Bookmark
-                    };
-                    drop(tweet);
-                    self.spawn_tweet_action(id, action);
-                }
+            KeyCode::Char('n') => {
+                // New tweet
+                self.push_screen(Screen::Compose {
+                    mode: ComposeMode::NewTweet,
+                    input: TextInput::new("What's happening?"),
+                });
             }
-
-            // Load more
+            KeyCode::Char('d') => {
+                // Open DMs
+                self.push_screen(Screen::Loading {
+                    message: "Loading messages...".to_string(),
+                });
+                self.spawn_dm_inbox();
+            }
+            KeyCode::Char('f') => self.toggle_like(),
+            KeyCode::Char('t') => self.toggle_retweet(),
+            KeyCode::Char('b') => self.toggle_bookmark(),
             KeyCode::Char(' ') => {
-                if self.cursor_bottom.is_some() {
-                    self.spawn_fetch_timeline(true);
+                if cursor_bottom.is_some() {
+                    self.spawn_fetch_timeline(tab, true, cursor_bottom);
                 }
             }
-
             _ => {}
         }
     }
 
-    fn handle_auth_key(&mut self, key: crossterm::event::KeyEvent) {
-        if key.code == KeyCode::Char('q') {
-            self.should_quit = true;
+    fn handle_detail_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('h') => self.pop_screen(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Screen::TweetDetail {
+                    replies,
+                    selected_reply,
+                    scroll_offset,
+                    ..
+                } = self.current_screen_mut()
+                {
+                    if !replies.is_empty() {
+                        *selected_reply = (*selected_reply + 1).min(replies.len() - 1);
+                        if *selected_reply > *scroll_offset + 8 {
+                            *scroll_offset = selected_reply.saturating_sub(4);
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Screen::TweetDetail {
+                    selected_reply,
+                    scroll_offset,
+                    ..
+                } = self.current_screen_mut()
+                {
+                    *selected_reply = selected_reply.saturating_sub(1);
+                    if *selected_reply < *scroll_offset {
+                        *scroll_offset = *selected_reply;
+                    }
+                }
+            }
+            KeyCode::Char('r') => {
+                // Reply to main tweet
+                if let Screen::TweetDetail {
+                    main_tweet: Some(tweet),
+                    ..
+                } = self.current_screen()
+                {
+                    let tweet_id = tweet.id.clone();
+                    let user = tweet.author.screen_name.clone();
+                    self.push_screen(Screen::Compose {
+                        mode: ComposeMode::Reply {
+                            tweet_id,
+                            reply_to_user: user,
+                        },
+                        input: TextInput::new("Tweet your reply"),
+                    });
+                }
+            }
+            KeyCode::Char('q') => {
+                // Quote main tweet
+                if let Screen::TweetDetail {
+                    main_tweet: Some(tweet),
+                    ..
+                } = self.current_screen()
+                {
+                    let url = format!(
+                        "https://x.com/{}/status/{}",
+                        tweet.author.screen_name, tweet.id
+                    );
+                    self.push_screen(Screen::Compose {
+                        mode: ComposeMode::Quote { tweet_url: url },
+                        input: TextInput::new("Add a comment"),
+                    });
+                }
+            }
+            KeyCode::Char('f') => self.toggle_like_detail(),
+            KeyCode::Char('p') => {
+                // Open profile of main tweet author
+                if let Screen::TweetDetail {
+                    main_tweet: Some(tweet),
+                    ..
+                } = self.current_screen()
+                {
+                    let sn = tweet.author.screen_name.clone();
+                    self.push_screen(Screen::Profile {
+                        screen_name: sn.clone(),
+                        user: None,
+                        tweets: Vec::new(),
+                        selected: 0,
+                        scroll_offset: 0,
+                        cursor_bottom: None,
+                    });
+                    self.spawn_user_profile(sn);
+                }
+            }
+            _ => {}
         }
     }
 
-    // ── Selection helpers ───────────────────────────────────────────
+    fn handle_profile_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('h') => self.pop_screen(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Screen::Profile {
+                    tweets,
+                    selected,
+                    scroll_offset,
+                    ..
+                } = self.current_screen_mut()
+                {
+                    if !tweets.is_empty() {
+                        *selected = (*selected + 1).min(tweets.len() - 1);
+                        if *selected > *scroll_offset + 10 {
+                            *scroll_offset = selected.saturating_sub(5);
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Screen::Profile {
+                    selected,
+                    scroll_offset,
+                    ..
+                } = self.current_screen_mut()
+                {
+                    *selected = selected.saturating_sub(1);
+                    if *selected < *scroll_offset {
+                        *scroll_offset = *selected;
+                    }
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('l') => {
+                if let Screen::Profile {
+                    tweets, selected, ..
+                } = self.current_screen()
+                {
+                    if let Some(tweet) = tweets.get(*selected) {
+                        let tweet_id = tweet.id.clone();
+                        self.push_screen(Screen::TweetDetail {
+                            tweet_id: tweet_id.clone(),
+                            main_tweet: None,
+                            parents: Vec::new(),
+                            replies: Vec::new(),
+                            selected_reply: 0,
+                            scroll_offset: 0,
+                        });
+                        self.spawn_tweet_detail(tweet_id);
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Screen::Profile {
+                    user,
+                    cursor_bottom,
+                    ..
+                } = self.current_screen()
+                {
+                    if let (Some(user), Some(cursor)) = (user, cursor_bottom) {
+                        let user_id = user.id.clone();
+                        let cursor = cursor.clone();
+                        let tx = self.api_tx.clone();
+                        let client = self.client.clone().unwrap();
+                        tokio::spawn(async move {
+                            match client.user_tweets(&user_id, 20, Some(&cursor)).await {
+                                Ok(response) => {
+                                    let _ = tx.send(ApiResult::UserTweets {
+                                        response,
+                                        user_id,
+                                        append: true,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(ApiResult::Error(e.to_string()));
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
-    fn select_next(&mut self) {
-        if !self.tweets.is_empty() {
-            self.selected = (self.selected + 1).min(self.tweets.len() - 1);
-            if self.selected > self.scroll_offset + 10 {
-                self.scroll_offset = self.selected.saturating_sub(5);
+    fn handle_compose_key(&mut self, key: crossterm::event::KeyEvent) {
+        if let Screen::Compose { input, mode } = self.current_screen_mut() {
+            let action = input.handle_key(key);
+            match action {
+                InputAction::Submit => {
+                    if !input.is_empty() {
+                        let text = input.text().to_string();
+                        let mode = mode.clone();
+                        // Can't borrow self mutably here, so clone what we need
+                        drop(input);
+                        self.spawn_send_tweet(text, mode);
+                        self.pop_screen();
+                        self.status_msg = Some("Sending tweet...".to_string());
+                    }
+                }
+                InputAction::Cancel => {
+                    self.pop_screen();
+                }
+                _ => {}
             }
         }
     }
 
-    fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-        if self.selected < self.scroll_offset {
-            self.scroll_offset = self.selected;
+    fn handle_dm_inbox_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.pop_screen(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Screen::DmInbox {
+                    conversations,
+                    selected,
+                } = self.current_screen_mut()
+                {
+                    if !conversations.is_empty() {
+                        *selected = (*selected + 1).min(conversations.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Screen::DmInbox { selected, .. } = self.current_screen_mut() {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                if let Screen::DmInbox {
+                    conversations,
+                    selected,
+                } = self.current_screen()
+                {
+                    if let Some(convo) = conversations.get(*selected) {
+                        let conv_id = convo.id.clone();
+                        let name = convo.participant.name.clone();
+                        self.push_screen(Screen::DmConversation {
+                            conversation_id: conv_id,
+                            participant_name: name,
+                            messages: Vec::new(),
+                            input: TextInput::new("Type a message..."),
+                            scroll_offset: 0,
+                        });
+                        // TODO: fetch DM conversation messages
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    fn select_first(&mut self) {
-        self.selected = 0;
-        self.scroll_offset = 0;
-    }
+    fn handle_dm_conversation_key(&mut self, key: crossterm::event::KeyEvent) {
+        if let Screen::DmConversation {
+            conversation_id,
+            input,
+            ..
+        } = self.current_screen_mut()
+        {
+            // Esc to go back (unless typing)
+            if key.code == KeyCode::Esc {
+                if input.content.is_empty() {
+                    drop(input);
+                    drop(conversation_id);
+                    self.pop_screen();
+                    return;
+                } else {
+                    input.clear();
+                    return;
+                }
+            }
 
-    fn select_last(&mut self) {
-        if !self.tweets.is_empty() {
-            self.selected = self.tweets.len() - 1;
-            self.scroll_offset = self.selected.saturating_sub(5);
+            let action = input.handle_key(key);
+            match action {
+                InputAction::Submit => {
+                    if !input.is_empty() {
+                        let text = input.text().to_string();
+                        let conv_id = conversation_id.clone();
+                        input.clear();
+                        self.spawn_send_dm(conv_id, text);
+                    }
+                }
+                InputAction::Cancel => {
+                    drop(input);
+                    drop(conversation_id);
+                    self.pop_screen();
+                }
+                _ => {}
+            }
         }
     }
+
+    // ── Tweet action helpers ────────────────────────────────────────
+
+    fn toggle_like(&mut self) {
+        if let Screen::Timeline {
+            tweets, selected, ..
+        } = self.current_screen_mut()
+        {
+            if let Some(tweet) = tweets.get_mut(*selected) {
+                let id = tweet.id.clone();
+                let action = if tweet.favorited {
+                    tweet.favorited = false;
+                    tweet.like_count = tweet.like_count.saturating_sub(1);
+                    TweetAction::Unlike
+                } else {
+                    tweet.favorited = true;
+                    tweet.like_count += 1;
+                    TweetAction::Like
+                };
+                drop(tweet);
+                self.spawn_tweet_action(id, action);
+            }
+        }
+    }
+
+    fn toggle_retweet(&mut self) {
+        if let Screen::Timeline {
+            tweets, selected, ..
+        } = self.current_screen_mut()
+        {
+            if let Some(tweet) = tweets.get_mut(*selected) {
+                let id = tweet.id.clone();
+                let action = if tweet.retweeted {
+                    tweet.retweeted = false;
+                    tweet.retweet_count = tweet.retweet_count.saturating_sub(1);
+                    TweetAction::Unretweet
+                } else {
+                    tweet.retweeted = true;
+                    tweet.retweet_count += 1;
+                    TweetAction::Retweet
+                };
+                drop(tweet);
+                self.spawn_tweet_action(id, action);
+            }
+        }
+    }
+
+    fn toggle_bookmark(&mut self) {
+        if let Screen::Timeline {
+            tweets, selected, ..
+        } = self.current_screen_mut()
+        {
+            if let Some(tweet) = tweets.get_mut(*selected) {
+                let id = tweet.id.clone();
+                let action = if tweet.bookmarked {
+                    tweet.bookmarked = false;
+                    TweetAction::Unbookmark
+                } else {
+                    tweet.bookmarked = true;
+                    TweetAction::Bookmark
+                };
+                drop(tweet);
+                self.spawn_tweet_action(id, action);
+            }
+        }
+    }
+
+    fn toggle_like_detail(&mut self) {
+        if let Screen::TweetDetail {
+            main_tweet: Some(tweet),
+            ..
+        } = self.current_screen_mut()
+        {
+            let id = tweet.id.clone();
+            let action = if tweet.favorited {
+                tweet.favorited = false;
+                tweet.like_count = tweet.like_count.saturating_sub(1);
+                TweetAction::Unlike
+            } else {
+                tweet.favorited = true;
+                tweet.like_count += 1;
+                TweetAction::Like
+            };
+            self.spawn_tweet_action(id, action);
+        }
+    }
+}
+
+/// Parse DM inbox from the v1.1 API response.
+fn parse_dm_inbox(data: &serde_json::Value) -> Vec<DmConversation> {
+    let Some(inbox) = data.get("inbox_initial_state") else {
+        return Vec::new();
+    };
+
+    let conversations = inbox
+        .get("conversations")
+        .and_then(|c| c.as_object())
+        .map(|c| c.values().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let users = inbox
+        .get("users")
+        .and_then(|u| u.as_object());
+
+    let mut result = Vec::new();
+
+    for convo in conversations {
+        let convo_id = convo
+            .get("conversation_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Get participants (other than self)
+        let participants = convo
+            .get("participants")
+            .and_then(|p| p.as_array())
+            .unwrap_or(&Vec::new())
+            .clone();
+
+        // Find the other user
+        let other_user_id = participants
+            .iter()
+            .filter_map(|p| p.get("user_id").and_then(|u| u.as_str()))
+            .next()
+            .unwrap_or_default();
+
+        let participant = if let Some(Some(user_data)) = users.map(|u| u.get(other_user_id)) {
+            User {
+                id: other_user_id.to_string(),
+                name: user_data
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                screen_name: user_data
+                    .get("screen_name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                description: None,
+                followers_count: 0,
+                following_count: 0,
+                tweet_count: 0,
+                verified: false,
+                profile_image_url: user_data
+                    .get("profile_image_url_https")
+                    .and_then(|u| u.as_str())
+                    .map(String::from),
+                profile_banner_url: None,
+                created_at: None,
+                following: false,
+                followed_by: false,
+            }
+        } else {
+            User {
+                id: other_user_id.to_string(),
+                name: "Unknown".to_string(),
+                screen_name: "unknown".to_string(),
+                description: None,
+                followers_count: 0,
+                following_count: 0,
+                tweet_count: 0,
+                verified: false,
+                profile_image_url: None,
+                profile_banner_url: None,
+                created_at: None,
+                following: false,
+                followed_by: false,
+            }
+        };
+
+        // Last message
+        let last_msg = convo
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
+
+        let unread = last_msg != "AT_END";
+
+        // Get last message from entries
+        let last_message = inbox
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| {
+                        e.get("message")
+                            .and_then(|m| m.get("conversation_id"))
+                            .and_then(|c| c.as_str())
+                            == Some(&convo_id)
+                    })
+                    .last()
+            })
+            .and_then(|entry| {
+                let msg_data = entry.get("message")?.get("message_data")?;
+                Some(DmMessage {
+                    id: entry
+                        .get("message")
+                        .and_then(|m| m.get("id"))
+                        .and_then(|i| i.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    text: msg_data
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    sender_id: msg_data
+                        .get("sender_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    created_at: None,
+                })
+            });
+
+        result.push(DmConversation {
+            id: convo_id,
+            participant,
+            last_message,
+            unread,
+        });
+    }
+
+    result
 }

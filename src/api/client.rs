@@ -272,6 +272,28 @@ impl XClient {
         }
     }
 
+    /// REST v1.1 GET request.
+    async fn rest_get(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
+        let url = format!("{API_V1_BASE}/{path}");
+        let headers = self.default_headers();
+
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .query(params)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("REST GET {path} failed: {status} - {body}")
+        }
+    }
+
     // ── Timeline endpoints ──────────────────────────────────────────
 
     /// Fetch the "For You" timeline.
@@ -549,6 +571,51 @@ impl XClient {
     pub async fn unblock(&self, user_id: &str) -> Result<Value> {
         self.rest_post("blocks/destroy.json", &[("user_id", user_id)])
             .await
+    }
+
+    // ── DM endpoints ───────────────────────────────────────────────
+
+    /// Fetch DM inbox via REST v1.1.
+    pub async fn dm_inbox(&self) -> Result<Value> {
+        self.rest_get(
+            "dm/inbox_initial_state.json",
+            &[
+                ("nsfw_filtering_enabled", "false"),
+                ("filter_low_quality", "false"),
+                ("include_quality", "all"),
+                ("dm_secret_conversations_enabled", "false"),
+                ("krs_registration_enabled", "true"),
+                ("cards_platform", "Web-12"),
+                ("include_cards", "1"),
+                ("include_ext_alt_text", "true"),
+                ("include_quote_count", "true"),
+                ("include_reply_count", "1"),
+                ("tweet_mode", "extended"),
+                ("include_ext_collab_control", "true"),
+                ("ext", "mediaColor,altText,mediaStats,highlightedLabel,hasNftAvatar,voiceInfo,birdwatchPivot,superFollowMetadata,unmentionInfo,editControl"),
+            ],
+        )
+        .await
+    }
+
+    /// Send a DM to a conversation.
+    pub async fn send_dm(&self, conversation_id: &str, text: &str) -> Result<Value> {
+        let request_id = format!("{:x}{:x}", rand::random::<u64>(), rand::random::<u64>());
+        let vars = serde_json::json!({
+            "target": {"participant_ids": []},
+            "requestId": request_id,
+            "dmComposerRequest": {
+                "conversationId": conversation_id,
+                "text": {"text": text},
+            },
+        });
+        self.graphql_post("useSendMessageMutation", vars, None).await
+    }
+
+    /// Delete a DM by message ID.
+    pub async fn delete_dm(&self, message_id: &str) -> Result<Value> {
+        let vars = serde_json::json!({"messageId": message_id});
+        self.graphql_post("DMMessageDeleteMutation", vars, None).await
     }
 }
 
