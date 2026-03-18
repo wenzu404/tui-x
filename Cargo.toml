@@ -36,11 +36,13 @@ hkdf = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
 argon2 = "0.5"
-curve25519-dalek = { version = "4", features = ["group"] }
+curve25519-dalek = { version = "4", features = ["group", "rand_core"] }
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
 ciborium = "0.2"
-snow = "0.9"              # Noise protocol
+snow = "0.9"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hex-literal = "0.4"
 
 # Utility
 dirs = "6"

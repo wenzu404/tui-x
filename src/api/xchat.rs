@@ -149,6 +149,12 @@ pub struct XChatMessageEvent {
     pub shared_tweet_id: Option<String>,
     pub shared_tweet_url: Option<String>,
     pub is_encrypted: bool,
+    /// Raw ciphertext from field 7.100 (for E2EE messages).
+    pub ciphertext: Option<Vec<u8>>,
+    /// Sender's signing key version from field 7.9.2.
+    pub sender_key_version: Option<String>,
+    /// Sender's signing public key from field 7.9.4 (DER-encoded SPKI).
+    pub sender_signing_key: Option<String>,
 }
 
 /// Decode a Thrift-serialized XChat message event from base64.
@@ -165,6 +171,9 @@ pub fn decode_message_event(b64: &str) -> Option<XChatMessageEvent> {
     let mut text: Option<String> = None;
     let mut shared_tweet_id: Option<String> = None;
     let mut shared_tweet_url: Option<String> = None;
+    let mut ciphertext: Option<Vec<u8>> = None;
+    let mut sender_key_version: Option<String> = None;
+    let mut sender_signing_key: Option<String> = None;
 
     // Read top-level fields
     loop {
@@ -187,6 +196,9 @@ pub fn decode_message_event(b64: &str) -> Option<XChatMessageEvent> {
                 text = result.text;
                 shared_tweet_id = result.tweet_id;
                 shared_tweet_url = result.tweet_url;
+                ciphertext = result.ciphertext;
+                sender_key_version = result.sender_key_version;
+                sender_signing_key = result.sender_signing_key;
             }
             _ => {
                 reader.skip(field_type);
@@ -203,6 +215,9 @@ pub fn decode_message_event(b64: &str) -> Option<XChatMessageEvent> {
         shared_tweet_id,
         shared_tweet_url,
         is_encrypted: jwt_token.is_some(),
+        ciphertext,
+        sender_key_version,
+        sender_signing_key,
     })
 }
 
@@ -210,6 +225,9 @@ struct MessageContent {
     text: Option<String>,
     tweet_id: Option<String>,
     tweet_url: Option<String>,
+    ciphertext: Option<Vec<u8>>,
+    sender_key_version: Option<String>,
+    sender_signing_key: Option<String>,
 }
 
 /// Parse the nested message content struct to extract text and shared tweet info.
@@ -218,7 +236,59 @@ fn parse_message_content(reader: &mut ThriftReader) -> MessageContent {
         text: None,
         tweet_id: None,
         tweet_url: None,
+        ciphertext: None,
+        sender_key_version: None,
+        sender_signing_key: None,
     };
+
+    // First, try to extract field 100 (ciphertext) and field 9 (sender key)
+    // by walking the struct fields at the top level
+    {
+        let save_pos = reader.pos;
+        loop {
+            let Some(ft) = reader.read_byte() else { break };
+            if ft == THRIFT_STOP { break; }
+            let Some(fid) = reader.read_i16() else { break };
+
+            match (ft, fid) {
+                (THRIFT_STRING, 100) => {
+                    // field 100 (0x64) = ciphertext (raw bytes)
+                    if let Some(bytes) = reader.read_bytes() {
+                        result.ciphertext = Some(bytes);
+                    }
+                }
+                (THRIFT_STRUCT, 9) => {
+                    // field 9 = sender key info struct
+                    // Extract strings from it (field 1=key_id, 2=version, 3=algo, 4=public_key)
+                    loop {
+                        let Some(sft) = reader.read_byte() else { break };
+                        if sft == THRIFT_STOP { break; }
+                        let Some(sfid) = reader.read_i16() else { break };
+                        if sft == THRIFT_STRING {
+                            if let Some(s) = reader.read_string() {
+                                match sfid {
+                                    2 => result.sender_key_version = Some(s),
+                                    4 => result.sender_signing_key = Some(s),
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            let _ = reader.skip(sft);
+                        }
+                    }
+                }
+                _ => {
+                    let _ = reader.skip(ft);
+                }
+            }
+        }
+        // If we got ciphertext, this is an encrypted message — don't try string extraction
+        if result.ciphertext.is_some() {
+            return result;
+        }
+        // Otherwise reset and do string extraction for plaintext messages
+        reader.pos = save_pos;
+    }
 
     // The content is a nested struct. We need to walk it looking for
     // readable text strings and tweet URLs.

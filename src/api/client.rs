@@ -661,6 +661,33 @@ impl XClient {
             anyhow::bail!("XChat inbox failed: {status} - {body}")
         }
     }
+
+    /// Fetch public keys for users (used for E2EE/Juicebox config).
+    pub async fn get_public_keys(&self, user_ids: &[&str]) -> Result<Value> {
+        let query_id = "GJQbOZALDO5D3Zp2IZhH6w";
+        let vars = serde_json::json!({
+            "ids": user_ids,
+            "include_juicebox_tokens": true,
+        });
+        let url = format!("{GRAPHQL_BASE}/{query_id}/GetPublicKeys");
+        let headers = self.default_headers();
+
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .query(&[("variables", serde_json::to_string(&vars)?)])
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GetPublicKeys failed: {status} - {body}")
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
