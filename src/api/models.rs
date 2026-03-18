@@ -257,54 +257,89 @@ impl Tweet {
 
 impl User {
     pub fn from_api_result(value: &serde_json::Value) -> Option<Self> {
-        let legacy = value.get("legacy")?;
+        let legacy = value.get("legacy");
+        let core = value.get("core");
+        let relationships = value.get("relationship_perspectives");
+
+        // name/screen_name: new API puts them in "core", old API in "legacy"
+        let name = core
+            .and_then(|c| c.get("name"))
+            .or_else(|| legacy.and_then(|l| l.get("name")))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let screen_name = core
+            .and_then(|c| c.get("screen_name"))
+            .or_else(|| legacy.and_then(|l| l.get("screen_name")))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // created_at: new API in "core", old in "legacy"
+        let created_at = core
+            .and_then(|c| c.get("created_at"))
+            .or_else(|| legacy.and_then(|l| l.get("created_at")))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // description: new API in "profile_bio.description", old in "legacy.description"
+        let description = value
+            .get("profile_bio")
+            .and_then(|pb| pb.get("description"))
+            .or_else(|| legacy.and_then(|l| l.get("description")))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // avatar: new API in "avatar.image_url", old in "legacy.profile_image_url_https"
+        let profile_image_url = value
+            .get("avatar")
+            .and_then(|a| a.get("image_url"))
+            .or_else(|| legacy.and_then(|l| l.get("profile_image_url_https")))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let profile_banner_url = legacy
+            .and_then(|l| l.get("profile_banner_url"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // Counts are still in legacy
+        let legacy_ref = legacy.unwrap_or(&serde_json::Value::Null);
+
+        // following/followed_by: new API in "relationship_perspectives", old in "legacy"
+        let following = relationships
+            .and_then(|r| r.get("following"))
+            .or_else(|| legacy.and_then(|l| l.get("following")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let followed_by = relationships
+            .and_then(|r| r.get("followed_by"))
+            .or_else(|| legacy.and_then(|l| l.get("followed_by")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         Some(User {
             id: value
                 .get("rest_id")
                 .and_then(|v| v.as_str())?
                 .to_string(),
-            name: legacy
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            screen_name: legacy
-                .get("screen_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            description: legacy
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            followers_count: get_u64(legacy, "followers_count"),
-            following_count: get_u64(legacy, "friends_count"),
-            tweet_count: get_u64(legacy, "statuses_count"),
+            name,
+            screen_name,
+            description,
+            followers_count: get_u64(legacy_ref, "followers_count"),
+            following_count: get_u64(legacy_ref, "friends_count"),
+            tweet_count: get_u64(legacy_ref, "statuses_count"),
             verified: value
                 .get("is_blue_verified")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
-            profile_image_url: legacy
-                .get("profile_image_url_https")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            profile_banner_url: legacy
-                .get("profile_banner_url")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            created_at: legacy
-                .get("created_at")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            following: legacy
-                .get("following")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            followed_by: legacy
-                .get("followed_by")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            profile_image_url,
+            profile_banner_url,
+            created_at,
+            following,
+            followed_by,
         })
     }
 }
