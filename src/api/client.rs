@@ -624,6 +624,43 @@ impl XClient {
         let vars = serde_json::json!({"messageId": message_id});
         self.graphql_post("DMMessageDeleteMutation", vars, None).await
     }
+
+    // ── XChat (new DM system) endpoints ─────────────────────────────
+
+    /// Fetch the XChat inbox via GraphQL (new DM system, replaces dm/inbox_initial_state).
+    pub async fn xchat_inbox(&self) -> Result<Value> {
+        let vars = serde_json::json!({
+            "max_local_sequence_id": null,
+            "query_settings": {
+                "conversation_event_limit": 200,
+                "inbox_conversation_event_limit": 5,
+                "inbox_conversation_limit": 20,
+                "user_event_limit": 500
+            },
+            "message_pull_version": null
+        });
+
+        // Use hardcoded queryId since this op may not be in the JS bundles
+        let query_id = "eOG61Fh6jrW46oeYqkm8Uw";
+        let url = format!("{GRAPHQL_BASE}/{query_id}/GetInitialXChatPageQuery");
+
+        let headers = self.default_headers();
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .query(&[("variables", serde_json::to_string(&vars)?)])
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("XChat inbox failed: {status} - {body}")
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

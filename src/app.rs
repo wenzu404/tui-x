@@ -378,68 +378,31 @@ impl App {
         let Some(client) = self.client.clone() else { return };
         let tx = self.api_tx.clone();
         tokio::spawn(async move {
-            // Fetch first page
-            let data = match client.dm_inbox(None).await {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = tx.send(ApiResult::Error(format!("DMs: {e}")));
-                    return;
+            // Try new XChat API first, fall back to old REST API
+            match client.xchat_inbox().await {
+                Ok(data) => {
+                    let (conversations, messages) =
+                        crate::api::xchat::parse_xchat_inbox(&data);
+                    let _ = tx.send(ApiResult::DmInbox(ParsedDmInbox {
+                        conversations,
+                        messages,
+                        my_user_id: None,
+                    }));
                 }
-            };
-
-            let mut parsed = parse_dm_inbox(&data);
-
-            // Paginate to get more conversations
-            let mut cursor = data
-                .pointer("/inbox_initial_state/cursor")
-                .and_then(|c| c.as_str())
-                .map(String::from);
-
-            for _ in 0..5 {
-                // max 5 pages to avoid infinite loop
-                let Some(ref c) = cursor else { break };
-                let Ok(next_data) = client.dm_inbox(Some(c)).await else {
-                    break;
-                };
-
-                // The paginated response uses "inbox_timeline" instead of "inbox_initial_state"
-                let next_inbox = next_data
-                    .get("inbox_timeline")
-                    .or_else(|| next_data.get("inbox_initial_state"));
-
-                if let Some(inbox) = next_inbox {
-                    // Parse additional conversations
-                    let next_page = parse_dm_page(inbox);
-                    if next_page.conversations.is_empty() {
-                        break;
-                    }
-                    // Merge
-                    for convo in next_page.conversations {
-                        if !parsed.conversations.iter().any(|c| c.id == convo.id) {
-                            parsed.conversations.push(convo);
+                Err(e) => {
+                    tracing::warn!("XChat inbox failed ({e}), falling back to REST API");
+                    // Fallback to old REST API
+                    match client.dm_inbox(None).await {
+                        Ok(data) => {
+                            let parsed = parse_dm_inbox(&data);
+                            let _ = tx.send(ApiResult::DmInbox(parsed));
+                        }
+                        Err(e2) => {
+                            let _ = tx.send(ApiResult::Error(format!("DMs: {e2}")));
                         }
                     }
-                    for (k, v) in next_page.messages {
-                        parsed.messages.entry(k).or_default().extend(v);
-                    }
-
-                    cursor = inbox
-                        .get("cursor")
-                        .and_then(|c| c.as_str())
-                        .map(String::from);
-                } else {
-                    break;
                 }
             }
-
-            // Re-sort by most recent
-            parsed.conversations.sort_by(|a, b| {
-                let a_id = a.last_message.as_ref().map(|m| m.id.as_str()).unwrap_or("");
-                let b_id = b.last_message.as_ref().map(|m| m.id.as_str()).unwrap_or("");
-                b_id.cmp(a_id)
-            });
-
-            let _ = tx.send(ApiResult::DmInbox(parsed));
         });
     }
 
