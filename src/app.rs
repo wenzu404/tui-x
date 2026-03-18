@@ -33,7 +33,7 @@ enum ApiResult {
         user_id: String,
         append: bool,
     },
-    DmInbox(Vec<DmConversation>),
+    DmInbox(ParsedDmInbox),
     DmMessages {
         conversation_id: String,
         messages: Vec<DmMessage>,
@@ -131,6 +131,8 @@ pub struct App {
     status_msg: Option<String>,
     api_rx: mpsc::UnboundedReceiver<ApiResult>,
     api_tx: mpsc::UnboundedSender<ApiResult>,
+    /// Cached DM messages by conversation_id.
+    dm_messages: std::collections::HashMap<String, Vec<DmMessage>>,
 }
 
 impl App {
@@ -175,6 +177,7 @@ impl App {
             status_msg: None,
             api_rx,
             api_tx,
+            dm_messages: std::collections::HashMap::new(),
         };
 
         // Start initial load
@@ -312,8 +315,8 @@ impl App {
         tokio::spawn(async move {
             match client.dm_inbox().await {
                 Ok(data) => {
-                    let convos = parse_dm_inbox(&data);
-                    let _ = tx.send(ApiResult::DmInbox(convos));
+                    let parsed = parse_dm_inbox(&data);
+                    let _ = tx.send(ApiResult::DmInbox(parsed));
                 }
                 Err(e) => {
                     let _ = tx.send(ApiResult::Error(format!("DMs: {e}")));
@@ -480,12 +483,16 @@ impl App {
                         *cursor_bottom = response.cursor_bottom;
                     }
                 }
-                ApiResult::DmInbox(convos) => {
+                ApiResult::DmInbox(parsed) => {
+                    if parsed.my_user_id.is_some() && self.my_user_id.is_empty() {
+                        self.my_user_id = parsed.my_user_id.unwrap_or_default();
+                    }
+                    self.dm_messages = parsed.messages;
                     let screen = self.current_screen_mut();
                     match screen {
                         Screen::Loading { .. } | Screen::DmInbox { .. } => {
                             *screen = Screen::DmInbox {
-                                conversations: convos,
+                                conversations: parsed.conversations,
                                 selected: 0,
                             };
                         }
@@ -1198,15 +1205,23 @@ impl App {
                 {
                     if let Some(convo) = conversations.get(*selected) {
                         let conv_id = convo.id.clone();
-                        let name = convo.participant.name.clone();
+                        let name = format!(
+                            "{} @{}",
+                            convo.participant.name,
+                            convo.participant.screen_name
+                        );
+                        let msgs = self
+                            .dm_messages
+                            .get(&conv_id)
+                            .cloned()
+                            .unwrap_or_default();
                         self.push_screen(Screen::DmConversation {
                             conversation_id: conv_id,
                             participant_name: name,
-                            messages: Vec::new(),
+                            messages: msgs,
                             input: TextInput::new("Type a message..."),
                             scroll_offset: 0,
                         });
-                        // TODO: fetch DM conversation messages
                     }
                 }
             }
@@ -1341,135 +1356,182 @@ impl App {
     }
 }
 
+/// Parsed DM inbox data with conversations and their messages.
+struct ParsedDmInbox {
+    conversations: Vec<DmConversation>,
+    /// All messages keyed by conversation_id.
+    messages: std::collections::HashMap<String, Vec<DmMessage>>,
+    /// The authenticated user's ID (inferred from participants).
+    my_user_id: Option<String>,
+}
+
 /// Parse DM inbox from the v1.1 API response.
-fn parse_dm_inbox(data: &serde_json::Value) -> Vec<DmConversation> {
-    let Some(inbox) = data.get("inbox_initial_state") else {
-        return Vec::new();
+fn parse_dm_inbox(data: &serde_json::Value) -> ParsedDmInbox {
+    let empty = ParsedDmInbox {
+        conversations: Vec::new(),
+        messages: std::collections::HashMap::new(),
+        my_user_id: None,
     };
 
-    let conversations = inbox
-        .get("conversations")
-        .and_then(|c| c.as_object())
-        .map(|c| c.values().collect::<Vec<_>>())
+    let Some(inbox) = data.get("inbox_initial_state") else {
+        return empty;
+    };
+
+    let users = inbox.get("users").and_then(|u| u.as_object());
+    let user_ids: Vec<String> = users
+        .map(|u| u.keys().cloned().collect())
         .unwrap_or_default();
 
-    let users = inbox
-        .get("users")
-        .and_then(|u| u.as_object());
+    let convos_obj = inbox
+        .get("conversations")
+        .and_then(|c| c.as_object());
+
+    // Collect all entries (messages) grouped by conversation
+    let mut messages_by_convo: std::collections::HashMap<String, Vec<DmMessage>> =
+        std::collections::HashMap::new();
+
+    if let Some(entries) = inbox.get("entries").and_then(|e| e.as_array()) {
+        for entry in entries {
+            if let Some(msg) = entry.get("message") {
+                let conv_id = msg
+                    .get("conversation_id")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let msg_data = msg.get("message_data");
+                let text = msg_data
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let sender_id = msg_data
+                    .and_then(|d| d.get("sender_id"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let time_ms = msg
+                    .get("time")
+                    .and_then(|t| t.as_str())
+                    .and_then(|s| s.parse::<i64>().ok());
+                let created_at = time_ms.and_then(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                });
+
+                messages_by_convo
+                    .entry(conv_id)
+                    .or_default()
+                    .push(DmMessage {
+                        id: msg
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        text,
+                        sender_id,
+                        created_at,
+                    });
+            }
+        }
+    }
+
+    // Sort messages by ID (chronological)
+    for msgs in messages_by_convo.values_mut() {
+        msgs.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+
+    // Infer my user_id: the participant that appears in all conversations
+    let mut my_user_id: Option<String> = None;
+    let Some(convos_map) = convos_obj else {
+        return ParsedDmInbox {
+            conversations: Vec::new(),
+            messages: messages_by_convo,
+            my_user_id,
+        };
+    };
+
+    // In a 1-on-1 convo, both participants are listed. The one that
+    // shows up in every conversation is "me".
+    let all_participant_ids: Vec<Vec<String>> = convos_map
+        .values()
+        .map(|c| {
+            c.get("participants")
+                .and_then(|p| p.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| p.get("user_id").and_then(|u| u.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+
+    if let Some(first) = all_participant_ids.first() {
+        for uid in first {
+            if all_participant_ids
+                .iter()
+                .all(|pids| pids.contains(uid))
+            {
+                my_user_id = Some(uid.clone());
+                break;
+            }
+        }
+    }
+    // Fallback: if only 1 convo, pick the first participant as "me" guess
+    // (we'll refine later when we have the authenticated user info)
 
     let mut result = Vec::new();
 
-    for convo in conversations {
+    for convo in convos_map.values() {
         let convo_id = convo
             .get("conversation_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
 
-        // Get participants (other than self)
-        let participants = convo
+        let participants: Vec<String> = convo
             .get("participants")
             .and_then(|p| p.as_array())
-            .unwrap_or(&Vec::new())
-            .clone();
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.get("user_id").and_then(|u| u.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        // Find the other user
+        // Find the other user (not me)
         let other_user_id = participants
             .iter()
-            .filter_map(|p| p.get("user_id").and_then(|u| u.as_str()))
-            .next()
+            .find(|uid| my_user_id.as_ref() != Some(uid))
+            .or_else(|| participants.first()) // fallback
+            .cloned()
             .unwrap_or_default();
 
-        let participant = if let Some(Some(user_data)) = users.map(|u| u.get(other_user_id)) {
-            User {
-                id: other_user_id.to_string(),
-                name: user_data
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                screen_name: user_data
-                    .get("screen_name")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                description: None,
-                followers_count: 0,
-                following_count: 0,
-                tweet_count: 0,
-                verified: false,
-                profile_image_url: user_data
-                    .get("profile_image_url_https")
-                    .and_then(|u| u.as_str())
-                    .map(String::from),
-                profile_banner_url: None,
-                created_at: None,
-                following: false,
-                followed_by: false,
-            }
-        } else {
-            User {
-                id: other_user_id.to_string(),
-                name: "Unknown".to_string(),
-                screen_name: "unknown".to_string(),
-                description: None,
-                followers_count: 0,
-                following_count: 0,
-                tweet_count: 0,
-                verified: false,
-                profile_image_url: None,
-                profile_banner_url: None,
-                created_at: None,
-                following: false,
-                followed_by: false,
-            }
-        };
+        let participant = make_user_from_dm_data(&other_user_id, users);
 
-        // Last message
-        let last_msg = convo
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default();
+        let last_message = messages_by_convo
+            .get(&convo_id)
+            .and_then(|msgs| msgs.last())
+            .cloned();
 
-        let unread = last_msg != "AT_END";
-
-        // Get last message from entries
-        let last_message = inbox
-            .get("entries")
-            .and_then(|e| e.as_array())
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .filter(|e| {
-                        e.get("message")
-                            .and_then(|m| m.get("conversation_id"))
-                            .and_then(|c| c.as_str())
-                            == Some(&convo_id)
+        // Read status
+        let my_last_read = convo
+            .get("participants")
+            .and_then(|p| p.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|p| {
+                        p.get("user_id").and_then(|u| u.as_str())
+                            == my_user_id.as_deref()
                     })
-                    .last()
-            })
-            .and_then(|entry| {
-                let msg_data = entry.get("message")?.get("message_data")?;
-                Some(DmMessage {
-                    id: entry
-                        .get("message")
-                        .and_then(|m| m.get("id"))
-                        .and_then(|i| i.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    text: msg_data
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    sender_id: msg_data
-                        .get("sender_id")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    created_at: None,
-                })
+                    .and_then(|p| p.get("last_read_event_id").and_then(|l| l.as_str()))
             });
+        let max_entry = convo
+            .get("max_entry_id")
+            .and_then(|m| m.as_str());
+        let unread = match (my_last_read, max_entry) {
+            (Some(read), Some(max)) => read != max,
+            _ => false,
+        };
 
         result.push(DmConversation {
             id: convo_id,
@@ -1479,5 +1541,66 @@ fn parse_dm_inbox(data: &serde_json::Value) -> Vec<DmConversation> {
         });
     }
 
-    result
+    // Sort by most recent message
+    result.sort_by(|a, b| {
+        let a_id = a.last_message.as_ref().map(|m| m.id.as_str()).unwrap_or("");
+        let b_id = b.last_message.as_ref().map(|m| m.id.as_str()).unwrap_or("");
+        b_id.cmp(a_id)
+    });
+
+    ParsedDmInbox {
+        conversations: result,
+        messages: messages_by_convo,
+        my_user_id,
+    }
+}
+
+fn make_user_from_dm_data(
+    user_id: &str,
+    users: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> User {
+    if let Some(user_data) = users.and_then(|u| u.get(user_id)) {
+        User {
+            id: user_id.to_string(),
+            name: user_data
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            screen_name: user_data
+                .get("screen_name")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            description: None,
+            followers_count: 0,
+            following_count: 0,
+            tweet_count: 0,
+            verified: false,
+            profile_image_url: user_data
+                .get("profile_image_url_https")
+                .and_then(|u| u.as_str())
+                .map(String::from),
+            profile_banner_url: None,
+            created_at: None,
+            following: false,
+            followed_by: false,
+        }
+    } else {
+        User {
+            id: user_id.to_string(),
+            name: "Unknown".to_string(),
+            screen_name: "unknown".to_string(),
+            description: None,
+            followers_count: 0,
+            following_count: 0,
+            tweet_count: 0,
+            verified: false,
+            profile_image_url: None,
+            profile_banner_url: None,
+            created_at: None,
+            following: false,
+            followed_by: false,
+        }
+    }
 }
