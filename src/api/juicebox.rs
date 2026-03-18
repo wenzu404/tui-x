@@ -425,12 +425,19 @@ async fn send_realm_request(
     let secrets_cbor = cbor_encode(secrets_request);
     let url = format!("{}req", realm.address);
 
+    // Common headers required by all realms
+    let version_header = "X-Juicebox-Version";
+    let sdk_version = "0.3.6";
+
     if realm.public_key.is_some() {
         // Hardware realm: wrap in Noise NK handshake
         let (body, noise) = build_hardware_request(realm, &secrets_cbor)?;
 
         let resp = http
             .post(&url)
+            .header(version_header, sdk_version)
+            .header("User-Agent", format!("JuiceboxSdk-Rust/{sdk_version}"))
+            .header("Content-Type", "application/cbor")
             .body(body)
             .send()
             .await
@@ -449,6 +456,11 @@ async fn send_realm_request(
         let resp = http
             .post(&url)
             .header("Authorization", format!("Bearer {}", realm.token))
+            .header(version_header, sdk_version)
+            .header("User-Agent", format!("JuiceboxSdk-Rust/{sdk_version}"))
+            .header("Content-Type", "application/cbor")
+            .header("Origin", "https://x.com")
+            .header("Referer", "https://x.com/")
             .body(secrets_cbor)
             .send()
             .await
